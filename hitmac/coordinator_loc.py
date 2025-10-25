@@ -50,7 +50,7 @@ class ValueNet(nn.Module):
 
 
 class LinearEncoder(nn.Module):
-    def __init__(self, input_dim, output_dim=128):
+    def __init__(self, input_dim, output_dim=154):
         super().__init__()
         self.layer = nn.Sequential(
             nn.Linear(input_dim, output_dim),
@@ -93,6 +93,13 @@ class CrossAttentionBlock(nn.Module):
 # Mixture-of-Policies components
 # -----------------------
 class AlphaNet(nn.Module):
+    
+    '''
+    Args:
+        The alpha weights of each agents is different
+        output: (n_agents, num_skills) -> (n_agents, )
+    
+    '''
     def __init__(self, input_dim, num_skills):
         super().__init__()
         self.net = nn.Sequential(
@@ -109,60 +116,113 @@ class AlphaNet(nn.Module):
 
 
 class Executor(nn.Module):
-    """Local skill policy π_i(a|o_i), outputs action probabilities."""
-    def __init__(self, obs_dim, action_dim):
+    """
+    Continuous skill policy π_i(a|o): outputs Gaussian mean and std.
+    Supports sampling and returning log-probs for training.
+    """
+    def __init__(self, obs_dim, action_dim, hidden_dim=128, log_std_min=-5, log_std_max=1):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(obs_dim, 128),
+            nn.Linear(obs_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(128, action_dim)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
         )
+        self.mean_layer = nn.Linear(hidden_dim, action_dim)
+        self.log_std_layer = nn.Linear(hidden_dim, action_dim)
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
 
-    def forward(self, obs):
-        # obs: (N_agents, obs_dim)
-        logits = self.net(obs)  # (N_agents, action_dim)
-        probs = F.softmax(logits, dim=-1)
-        return probs
+        # Weight initialization
+        nn.init.xavier_uniform_(self.mean_layer.weight, gain=0.01)
+        nn.init.xavier_uniform_(self.log_std_layer.weight, gain=0.01)
+        nn.init.zeros_(self.mean_layer.bias)
+        nn.init.zeros_(self.log_std_layer.bias)
+
+    def forward(self, obs, deterministic=False, with_logprob=True):
+        """
+        Args:
+            obs: (N_agents, obs_dim)
+            deterministic: if True, return mean actions (no sampling)
+            with_logprob: if True, return log_prob for SAC-style training
+        Returns:
+            actions: (N_agents, action_dim)
+            log_probs (optional): (N_agents, 1)
+            mean: (N_agents, action_dim)
+        """
+        h = self.net(obs)
+        mean = self.mean_layer(h)
+        log_std = self.log_std_layer(h)
+        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
+        std = log_std.exp()
+
+        if deterministic:
+            action = mean
+            log_prob = None
+        else:
+            # Reparameterization trick: sample from N(mean, std)
+            normal = torch.distributions.Normal(mean, std)
+            x_t = normal.rsample()  # (N_agents, action_dim)
+            action = torch.tanh(x_t)  # bound to [-1, 1]
+            if with_logprob:
+                # Compute log prob (for SAC-style objective)
+                log_prob = normal.log_prob(x_t)
+                log_prob -= torch.log(1 - action.pow(2) + 1e-6)  # tanh correction
+                log_prob = log_prob.sum(dim=-1, keepdim=True)
+            else:
+                log_prob = None
+
+        return action, log_prob, mean
+
 
 
 class MoPNetwork(nn.Module):
     """
-    Given per-agent obs and per-agent goal-features, compute alphas and form
-    mixed policy: pi_C = sum_i alpha_i * pi_i(.|o).
+    Mixture-of-Policies for continuous control.
+    Combines outputs of skill Executors via weighted sum of means.
     """
     def __init__(self, obs_dim, goal_dim, num_skills, action_dim):
         super().__init__()
         self.num_skills = num_skills
         self.action_dim = action_dim
         self.alpha_net = AlphaNet(obs_dim + goal_dim, num_skills)
-        self.executors = nn.ModuleList([Executor(obs_dim, action_dim) for _ in range(num_skills)])
+        self.executors = nn.ModuleList([
+            Executor(obs_dim, action_dim) for _ in range(num_skills)
+        ])
 
-    def forward(self, obs, final_g):
+    def forward(self, obs, final_g, deterministic=False):
         """
-        obs: (N_agents, obs_dim)
-        final_g: (N_agents, goal_dim)
-        returns:
-            mixed_probs: (N_agents, action_dim)
+        Args:
+            obs: (N_agents, obs_dim)
+            final_g: (N_agents, goal_dim)
+        Returns:
+            mixed_action: (N_agents, action_dim)
             alphas: (N_agents, num_skills)
-            executors_probs: (num_skills, N_agents, action_dim)
+            executor_means: (num_skills, N_agents, action_dim)
         """
-        concat = torch.cat([obs, final_g], dim=-1)  # (N, obs+goal)
-        alphas = self.alpha_net(concat)  # (N, num_skills)
+        concat = torch.cat([obs, final_g], dim=-1)  # (N_agents, obs+goal)
+        alphas = self.alpha_net(concat)  # (N_agents, num_skills)
 
-        # compute each executor's probs for all agents
-        exec_probs = []
+        # Collect each executor’s action
+        exec_means = []
+        exec_actions = []
         for executor in self.executors:
-            p = executor(obs)  # (N, action_dim)
-            exec_probs.append(p.unsqueeze(0))  # (1, N, action_dim)
-        exec_probs = torch.cat(exec_probs, dim=0)  # (num_skills, N, action_dim)
+            a, _, mean = executor(obs, deterministic=deterministic)
+            exec_means.append(mean.unsqueeze(0))   # (1, N_agents, action_dim)
+            exec_actions.append(a.unsqueeze(0))    # (1, N_agents, action_dim)
 
-        # transpose to (N, num_skills, action_dim)
-        exec_probs = exec_probs.permute(1, 0, 2)  # (N, num_skills, action_dim)
-        alphas_exp = alphas.unsqueeze(-1)  # (N, num_skills, 1)
-        weighted = exec_probs * alphas_exp  # (N, num_skills, action_dim)
-        mixed = weighted.sum(dim=1)  # (N, action_dim)
+        exec_means = torch.cat(exec_means, dim=0)   # (num_skills, N_agents, action_dim)
+        exec_actions = torch.cat(exec_actions, dim=0)
 
-        return mixed, alphas, exec_probs
+        # Weighted mixture
+        exec_means = exec_means.permute(1, 0, 2)  # (N_agents, num_skills, action_dim)
+        exec_actions = exec_actions.permute(1, 0, 2)
+        alphas_exp = alphas.unsqueeze(-1)  # (N_agents, num_skills, 1)
+
+        mixed_action = (exec_actions * alphas_exp).sum(dim=1)  # (N_agents, action_dim)
+        mixed_mean = (exec_means * alphas_exp).sum(dim=1)
+
+        return mixed_action, alphas, exec_means, mixed_mean
 
 
 # -----------------------
@@ -192,7 +252,7 @@ class Coordinator(nn.Module):
 
 
 class Ours(nn.Module):
-    def __init__(self, obs_space, num_skills=4, action_dim=3):
+    def __init__(self, obs_space, num_skills=4, action_dim=2, pretrain_file = "included"):
         super().__init__()
         self.num_skills = num_skills
         self.action_dim = action_dim
@@ -212,7 +272,22 @@ class Ours(nn.Module):
         self.final_layer = nn.Linear(64, 32)  # final_G dim = 32
 
         # MoP: uses per-agent obs (128) and per-agent final_G (32)
-        self.mop = MoPNetwork(obs_dim=128, goal_dim=32, num_skills=num_skills, action_dim=action_dim)
+        self.mop = MoPNetwork(obs_dim=154, goal_dim=32, num_skills=num_skills, action_dim=action_dim)
+        
+        if pretrain_file:
+            model_weights = torch.load("diayn_executor_library_mate_v2.pth", map_location="cpu")
+
+            executor_weights_list = model_weights["executors"]  # this is a list of dicts
+            assert len(executor_weights_list) == len(self.mop.executors), \
+                f"Mismatch: found {len(executor_weights_list)} executors in file, " \
+                f"but {len(self.mop.executors)} in MoPNetwork"
+
+            for i, state_dict in enumerate(executor_weights_list):
+                self.mop.executors[i].load_state_dict(state_dict)
+
+            print(f"✅ Loaded {len(executor_weights_list)} executors from DIAYN model successfully!")
+
+
 
     def forward(self, x, deterministic=False):
         """
@@ -235,17 +310,17 @@ class Ours(nn.Module):
         final_G = self.final_layer(hidden)  # (N_agents, 32)
 
         # Now mixture-of-policies
-        mixed_probs, alphas, exec_probs = self.mop(obs_encoded, final_G)  # mixed_probs: (N, action_dim)
+        mixed_action, alphas, exec_means, mixed_mean = self.mop(x, final_G)
 
-        sampled_actions = sample_from_probs(mixed_probs, deterministic=deterministic)
+
 
         return {
             "final_G": final_G,
             "value": values,
-            "mixed_probs": mixed_probs,
+            "mixed_probs": mixed_mean,
             "alphas": alphas,
-            "executor_probs": exec_probs,   # (num_skills, N, action_dim) permuted earlier
-            "sampled_actions": sampled_actions
+            "executor_probs": exec_means,   # (num_skills, N, action_dim) permuted earlier
+            "sampled_actions": mixed_action
         }
 
 
@@ -253,13 +328,13 @@ class Ours(nn.Module):
 # Quick smoke test
 # -----------------------
 if __name__ == "__main__":
-    # Example: 8 cameras, each obs dim = 154
+    # # Example: 8 cameras, each obs dim = 154
     N_agents = 8
     obs_dim = 154
     x = torch.randn(N_agents, obs_dim)
 
     # instantiate model: 4 executors (skills), action_dim=3
-    model = Ours(obs_space=obs_dim, num_skills=4, action_dim=3)
+    model = Ours(obs_space=obs_dim, num_skills=4, action_dim=2, pretrain_file="diayn_executor_library_mate_v2.pth")
     out = model(x, deterministic=False)
 
     print("final_G shape:", out["final_G"].shape)        # (8, 32)
@@ -267,3 +342,5 @@ if __name__ == "__main__":
     print("mixed_probs shape:", out["mixed_probs"].shape) # (8, 3)
     print("alphas shape:", out["alphas"].shape)          # (8, 4)
     print("sampled_actions shape:", out["sampled_actions"].shape)  # (8,)
+
+    # print(out)

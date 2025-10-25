@@ -239,4 +239,51 @@ class DIAYNAgent:
 
         return disc_loss_value, per_skill_losses
     
-    
+    def save_models(self, path):
+        """Save all model and optimizer states."""
+        checkpoint = {
+            "executors": [exec.state_dict() for exec in self.executors],
+            "critics": [crit.state_dict() for crit in self.critics],
+            "critic_targets": [ct.state_dict() for ct in self.critic_targets],
+            "discriminator": self.discriminator.state_dict(),
+
+            "executor_optimizers": [opt.state_dict() for opt in self.executor_optimizers],
+            "critic_optimizers": [opt.state_dict() for opt in self.critic_optimizers],
+            "discriminator_optimizer": self.discriminator_optimizer.state_dict(),
+
+            # Optionally save state normalization and replay buffer
+            "state_norm": {
+                "mean": self.state_norm.mean,
+                "var": self.state_norm.var,
+                "count": self.state_norm.count
+            },
+        }
+        torch.save(checkpoint, path)
+        print(f"Saved DIAYN agent to {path}")
+
+    def load_models(self, path, map_location=None):
+        """Load all model and optimizer states."""
+        checkpoint = torch.load(path, map_location=map_location)
+        for exec, sd in zip(self.executors, checkpoint["executors"]):
+            exec.load_state_dict(sd)
+        for crit, sd in zip(self.critics, checkpoint["critics"]):
+            crit.load_state_dict(sd)
+        for ct, sd in zip(self.critic_targets, checkpoint["critic_targets"]):
+            ct.load_state_dict(sd)
+        self.discriminator.load_state_dict(checkpoint["discriminator"])
+
+        for opt, sd in zip(self.executor_optimizers, checkpoint["executor_optimizers"]):
+            opt.load_state_dict(sd)
+        for opt, sd in zip(self.critic_optimizers, checkpoint["critic_optimizers"]):
+            opt.load_state_dict(sd)
+        self.discriminator_optimizer.load_state_dict(checkpoint["discriminator_optimizer"])
+
+        # Restore normalization stats
+        sn = checkpoint.get("state_norm", None)
+        if sn is not None:
+            self.state_norm.mean = sn["mean"]
+            self.state_norm.var = sn["var"]
+            self.state_norm.count = sn["count"]
+
+        print(f"Loaded DIAYN agent from {path}")
+        
