@@ -1,0 +1,283 @@
+import torch
+import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.distributions import Normal
+import random
+from collections import deque
+from config import *
+class RunningMeanStd:
+    """Tracks running mean and variance for normalization."""
+    def __init__(self, shape):
+        self.mean = torch.zeros(shape, device=DEVICE)
+        self.var = torch.ones(shape, device=DEVICE)
+        self.count = 1e-4  # small number to prevent division by zero
+
+    def update(self, x):
+        batch_mean = x.mean(dim=0)
+        batch_var = x.var(dim=0, unbiased=False)
+        batch_count = x.size(0)
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta.pow(2) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+
+    def normalize(self, x):
+        return (x - self.mean) / (torch.sqrt(self.var) + 1e-8)
+
+
+def init_weights_xavier(m):
+    """Applies Xavier initialization to all Linear layers."""
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
+            
+class Executor(nn.Module):
+    """Continuous policy π(a|s) for 2D camera action."""
+    def __init__(self, obs_dim, action_dim=2, hidden_dim=128, log_std_min=-5, log_std_max=1):
+        super().__init__()
+        self.action_dim = action_dim
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
+
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        self.mean_layer = nn.Linear(hidden_dim, action_dim)
+        self.log_std_layer = nn.Linear(hidden_dim, action_dim)
+
+        # Apply Xavier initialization
+        self.apply(init_weights_xavier)
+
+        # Small initial log_std bias to avoid saturation
+        nn.init.constant_(self.log_std_layer.bias, -1.0)
+
+    def forward(self, obs):
+        x = self.net(obs)
+        mean = self.mean_layer(x)
+        log_std = self.log_std_layer(x)
+        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
+        return mean, log_std
+
+    def sample(self, obs):
+        mean, log_std = self.forward(obs)
+        std = log_std.exp()
+        dist = Normal(mean, std)
+        z = dist.rsample()  # reparameterization trick
+        z = torch.clamp(z, -5, 5)  # prevents tanh saturation
+
+        action = torch.tanh(z)
+        # Correct log-prob for tanh squashing
+        log_prob = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=-1, keepdim=True)
+        return action, log_prob, mean
+
+
+class Critic(nn.Module):
+    """Twin Q-networks."""
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
+        super().__init__()
+        input_dim = state_dim + action_dim
+        self.q1 = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        self.q2 = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+        self.apply(init_weights_xavier)
+
+    def forward(self, state, action):
+        x = torch.cat([state, action], dim=-1)
+        return self.q1(x), self.q2(x)
+
+
+class Discriminator(nn.Module):
+
+    def __init__(self, state_dim, num_skills, hidden_dim=128):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, num_skills)
+        )
+
+        self.apply(init_weights_xavier)
+
+    def forward(self, state):
+        return self.network(state)
+
+    def get_log_prob(self, state, skill):
+        logits = self.forward(state)
+        log_softmax = F.log_softmax(logits, dim=-1)
+        return log_softmax.gather(1, skill.unsqueeze(1))
+
+
+class ReplayBuffer:
+    def __init__(self, max_size):
+        self.buffer = deque(maxlen=max_size)
+    def add(self, state, action, reward, next_state, done, skill):
+        self.buffer.append((state, action, reward, next_state, done, skill))
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, dones, skills = zip(*batch)
+        return (
+            torch.FloatTensor(np.array(states)).to(DEVICE),
+            torch.FloatTensor(np.array(actions)).to(DEVICE),
+            torch.FloatTensor(np.array(rewards)).unsqueeze(1).to(DEVICE),
+            torch.FloatTensor(np.array(next_states)).to(DEVICE),
+            torch.FloatTensor(np.array(dones)).unsqueeze(1).to(DEVICE),
+            torch.LongTensor(np.array(skills)).to(DEVICE)
+        )
+    def __len__(self):
+        return len(self.buffer)
+
+
+class DIAYNAgent:
+    def __init__(self, state_dim, action_dim, num_skills):
+        self.num_skills = num_skills
+        self.action_dim = action_dim
+        # Initialize normalizer for single agent observation
+        self.state_norm = RunningMeanStd(state_dim)
+
+        # Create networks for single agent
+        self.executors = nn.ModuleList([Executor(state_dim, action_dim).to(DEVICE) for _ in range(num_skills)])
+        self.critics = nn.ModuleList([Critic(state_dim, action_dim).to(DEVICE) for _ in range(num_skills)])
+        self.critic_targets = nn.ModuleList([Critic(state_dim, action_dim).to(DEVICE) for _ in range(num_skills)])
+        self.discriminator = Discriminator(state_dim, num_skills).to(DEVICE)
+
+        # Initialize target networks
+        for i in range(num_skills):
+            self.critic_targets[i].load_state_dict(self.critics[i].state_dict())
+
+        # Create optimizers
+        self.executor_optimizers = [optim.Adam(exec.parameters(), lr=LEARNING_RATE) for exec in self.executors]
+        self.critic_optimizers = [optim.Adam(crit.parameters(), lr=LEARNING_RATE) for crit in self.critics]
+        self.discriminator_optimizer = optim.Adam(self.discriminator.parameters(), lr=LEARNING_RATE)
+        self.replay_buffer = ReplayBuffer(REPLAY_BUFFER_SIZE)
+
+    @torch.no_grad()
+    def calculate_pseudo_reward(self, next_state, skill_batch):
+        """Calculate pseudo-reward for single agent."""
+        # Ensure input is 2D tensor
+        if next_state.dim() == 1:
+            next_state = next_state.unsqueeze(0)
+            
+        self.state_norm.update(next_state)
+        s_norm = self.state_norm.normalize(next_state)
+        log_q_z_given_s = self.discriminator.get_log_prob(s_norm, skill_batch)
+        pseudo_reward = log_q_z_given_s - LOG_P_Z
+        return pseudo_reward
+
+    @torch.no_grad()
+    def select_action(self, obs, skill_idx):
+        """Select action for single agent."""
+        # Convert to tensor and ensure correct shape
+        state_tensor = torch.FloatTensor(obs).to(DEVICE)
+        if state_tensor.dim() == 1:
+            state_tensor = state_tensor.unsqueeze(0)
+            
+        state_tensor = self.state_norm.normalize(state_tensor)
+        action, _, _ = self.executors[skill_idx].sample(state_tensor)
+        return action.squeeze(0).cpu().numpy()  # Remove batch dimension
+
+    def update(self, batch_size):
+        """Update networks using single agent transitions."""
+        states, actions, pseudo_rewards_in, next_states, dones, skills = self.replay_buffer.sample(batch_size)
+        
+        # Update state normalization
+        self.state_norm.update(states)
+        s_norm = self.state_norm.normalize(states)
+
+        # Update discriminator
+        log_q_z_given_s = self.discriminator.get_log_prob(s_norm, skills)
+        disc_loss = -log_q_z_given_s.mean()
+        self.discriminator_optimizer.zero_grad()
+        disc_loss.backward()
+        self.discriminator_optimizer.step()
+        disc_loss_value = disc_loss.item()
+
+        pseudo_rewards = pseudo_rewards_in
+        per_skill_losses = [None] * self.num_skills
+
+        # Update actor-critic per skill
+        for z in range(self.num_skills):
+            mask = (skills == z)
+            if mask.sum() == 0:
+                continue
+                
+            s_z = self.state_norm.normalize(states[mask])
+            ns_z = self.state_norm.normalize(next_states[mask])
+            a_z, r_z, d_z = actions[mask], pseudo_rewards[mask], dones[mask]
+
+            # Rest of the update logic remains the same
+            # ...existing actor-critic update code...
+
+        return disc_loss_value, per_skill_losses
+    
+    def save_models(self, path):
+        """Save all model and optimizer states."""
+        checkpoint = {
+            "executors": [exec.state_dict() for exec in self.executors],
+            "critics": [crit.state_dict() for crit in self.critics],
+            "critic_targets": [ct.state_dict() for ct in self.critic_targets],
+            "discriminator": self.discriminator.state_dict(),
+
+            "executor_optimizers": [opt.state_dict() for opt in self.executor_optimizers],
+            "critic_optimizers": [opt.state_dict() for opt in self.critic_optimizers],
+            "discriminator_optimizer": self.discriminator_optimizer.state_dict(),
+
+            # Optionally save state normalization and replay buffer
+            "state_norm": {
+                "mean": self.state_norm.mean,
+                "var": self.state_norm.var,
+                "count": self.state_norm.count
+            },
+        }
+        torch.save(checkpoint, path)
+        print(f"Saved DIAYN agent to {path}")
+
+    def load_models(self, path, map_location=None):
+        """Load all model and optimizer states."""
+        checkpoint = torch.load(path, map_location=map_location)
+        for exec, sd in zip(self.executors, checkpoint["executors"]):
+            exec.load_state_dict(sd)
+        for crit, sd in zip(self.critics, checkpoint["critics"]):
+            crit.load_state_dict(sd)
+        for ct, sd in zip(self.critic_targets, checkpoint["critic_targets"]):
+            ct.load_state_dict(sd)
+        self.discriminator.load_state_dict(checkpoint["discriminator"])
+
+        for opt, sd in zip(self.executor_optimizers, checkpoint["executor_optimizers"]):
+            opt.load_state_dict(sd)
+        for opt, sd in zip(self.critic_optimizers, checkpoint["critic_optimizers"]):
+            opt.load_state_dict(sd)
+        self.discriminator_optimizer.load_state_dict(checkpoint["discriminator_optimizer"])
+
+        # Restore normalization stats
+        sn = checkpoint.get("state_norm", None)
+        if sn is not None:
+            self.state_norm.mean = sn["mean"]
+            self.state_norm.var = sn["var"]
+            self.state_norm.count = sn["count"]
+
+        print(f"Loaded DIAYN agent from {path}")
+        

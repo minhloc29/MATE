@@ -25,6 +25,7 @@ def group_reset(
     """Reset a group of agents."""
 
     for agent, observation in zip(agents, joint_observation):
+        
         agent.reset(observation)
 
 
@@ -149,7 +150,7 @@ class SingleTeamHelper(gym.Wrapper, metaclass=WrapperMeta):
         from mate.wrappers.repeated_reward_individual_done import RepeatedRewardIndividualDone
 
         self.repeated_reward_individual_done = isinstance(env, RepeatedRewardIndividualDone)
-
+        self.shuffle_entities = True
     @property
     def num_adversaries(self):  # pylint: disable=missing-function-docstring
         return self.num_opponents
@@ -403,7 +404,7 @@ class SingleTeamSingleAgent(SingleTeamHelper):  # pylint: disable=too-many-insta
         self.index = self.num_teammates - 1
         self.teammate_agents = list(self.teammate_agents_ordered)
         if self.shuffle_entities:
-            self.index = self.np_random.randint(self.num_teammates)
+            self.index = self.np_random.integers(self.num_teammates)
             self.np_random.shuffle(self.teammate_agents)
 
         group_reset(
