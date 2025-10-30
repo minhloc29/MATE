@@ -128,7 +128,7 @@ class Discriminator(nn.Module):
     def get_log_prob(self, state, skill):
         logits = self.forward(state)
         log_softmax = F.log_softmax(logits, dim=-1)
-        return log_softmax.gather(1, skill.unsqueeze(1))
+        return log_softmax.gather(1, skill.unsqueeze(1)) # logqϕ​(z=skill∣s)
 
 
 class ReplayBuffer:
@@ -183,6 +183,7 @@ class DIAYNAgent:
             
         self.state_norm.update(next_state)
         s_norm = self.state_norm.normalize(next_state)
+        print(f"Look at state normalization: {s_norm}")
         log_q_z_given_s = self.discriminator.get_log_prob(s_norm, skill_batch)
         pseudo_reward = log_q_z_given_s - LOG_P_Z
         return pseudo_reward
@@ -228,8 +229,30 @@ class DIAYNAgent:
             ns_z = self.state_norm.normalize(next_states[mask])
             a_z, r_z, d_z = actions[mask], pseudo_rewards[mask], dones[mask]
 
-            # Rest of the update logic remains the same
-            # ...existing actor-critic update code...
+            with torch.no_grad():
+                next_action, next_log_prob, _ = self.executors[z].sample(ns_z)
+                tq1, tq2 = self.critic_targets[z](ns_z, next_action)
+                target_q = r_z + (1 - d_z) * GAMMA * (torch.min(tq1, tq2) - ALPHA * next_log_prob)
+
+            q1, q2 = self.critics[z](s_z, a_z)
+            critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
+            self.critic_optimizers[z].zero_grad()
+            critic_loss.backward()
+            self.critic_optimizers[z].step()
+
+            new_action, log_prob, _ = self.executors[z].sample(s_z)
+            q1_pi, q2_pi = self.critics[z](s_z, new_action)
+            q_min = torch.min(q1_pi, q2_pi)
+            actor_loss = (ALPHA * log_prob - q_min).mean()
+            self.executor_optimizers[z].zero_grad()
+            actor_loss.backward()
+            self.executor_optimizers[z].step()
+
+            # --- Soft Update ---
+            for tp, p in zip(self.critic_targets[z].parameters(), self.critics[z].parameters()):
+                tp.data.copy_(TAU * p.data + (1.0 - TAU) * tp.data)
+
+            per_skill_losses[z] = (critic_loss.item(), actor_loss.item())
 
         return disc_loss_value, per_skill_losses
     

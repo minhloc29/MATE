@@ -15,3 +15,5 @@ checkpoints/
 hitmac/
 
 *.pth
+.vscode/
+Logs/

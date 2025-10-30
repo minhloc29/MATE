@@ -89,7 +89,20 @@ def main():
             obs = next_obs[0]  # Take first camera's observation
             episode_steps = 0
 
-        # ...existing training code...
+        if len(agent.replay_buffer) > BATCH_SIZE * 10:
+            # update() returns loss diagnostics now
+            disc_loss_value, per_skill_losses = agent.update(BATCH_SIZE)
+            disc_loss_history.append(disc_loss_value)
+            for z in range(NUM_SKILLS):
+                if per_skill_losses[z] is not None:
+                    c_loss, a_loss = per_skill_losses[z]
+                    critic_loss_history[z].append(c_loss)
+                    actor_loss_history[z].append(a_loss)
+            update_steps += 1
+
+            if update_steps % 100 == 0:
+                print(f"[Update {update_steps}] DiscLoss={disc_loss_value:.4f}, "
+                      f"Replay={len(agent.replay_buffer):,}, Step={total_steps:,}")
 
     print("🎯 Pre-training complete.")
     agent.save_models("diayn_single_camera_skills_v1.pth")
